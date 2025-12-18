@@ -1,131 +1,114 @@
-__import__("pysqlite3")
-import sys
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+# app.py
+# Fully working Streamlit app: PDF/TXT upload + summarization + Q&A using Groq
 
 import streamlit as st
 import os
-import tempfile
-from pypdf import PdfReader
-from fastembed import TextEmbedding
-import chromadb
-from chromadb.config import Settings
+import time
 from groq import Groq
+from PyPDF2 import PdfReader
 
-st.set_page_config(page_title="RAG Chatbot", layout="wide")
+# -------------------- CONFIG --------------------
+st.set_page_config(page_title="Groq PDF Assistant", layout="wide")
 
-api_key = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
-if not api_key:
+# Load API key
+if "GROQ_API_KEY" in st.secrets:
+    os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+
+if not os.getenv("GROQ_API_KEY"):
     st.error("GROQ_API_KEY not configured")
     st.stop()
 
-client = Groq(api_key=api_key)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL = "llama3-8b-8192"
 
-@st.cache_resource
-def load_resources():
-    embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    db_dir = os.path.join(tempfile.gettempdir(), "chroma_rag_db")
-    chroma_client = chromadb.PersistentClient(
-        path=db_dir,
-        settings=Settings(anonymized_telemetry=False)
-    )
-    return embedder, chroma_client
+# -------------------- HELPERS --------------------
 
-embedder, chroma_client = load_resources()
-
-def get_collection():
-    return chroma_client.get_or_create_collection(
-        name="rag_collection",
-        metadata={"hnsw:space": "cosine"}
-    )
-
-with st.sidebar:
-    st.subheader("Knowledge Base")
-    uploaded_files = st.file_uploader(
-        "Upload PDF or TXT files",
-        type=["pdf", "txt"],
-        accept_multiple_files=True
-    )
-    process_btn = st.button("Process & Train")
-
-if process_btn and uploaded_files:
-    status = st.empty()
-    status.info("Processing documents...")
-
-    try:
-        chroma_client.delete_collection("rag_collection")
-    except:
-        pass
-
-    collection = get_collection()
-    chunks = []
-
-    for file in uploaded_files:
-        text = ""
-        try:
-            if file.name.endswith(".pdf"):
-                reader = PdfReader(file)
-                for page in reader.pages:
-                    text += page.extract_text() or ""
-            else:
-                text = file.read().decode("utf-8")
-
-            chunk_size = 800
-            overlap = 100
-            for i in range(0, len(text), chunk_size - overlap):
-                chunk = text[i:i + chunk_size]
-                if len(chunk) > 50:
-                    chunks.append(chunk)
-        except:
-            pass
-
-    if chunks:
-        for i in range(0, len(chunks), 100):
-            batch = chunks[i:i + 100]
-            embeddings = [e.tolist() for e in embedder.embed(batch)]
-            ids = [f"doc_{i+j}" for j in range(len(batch))]
-            collection.add(documents=batch, embeddings=embeddings, ids=ids)
-
-        status.success(f"Indexed {len(chunks)} chunks")
+def read_file(file):
+    if file.type == "application/pdf":
+        reader = PdfReader(file)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     else:
-        status.error("No readable text found")
+        return file.read().decode("utf-8")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+def chunk_text(text, chunk_size=1500, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+    return chunks
 
-prompt = st.chat_input("Ask a question")
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
 
-    try:
-        collection = get_collection()
-        q_embed = embedder.embed([prompt])[0].tolist()
-        results = collection.query(query_embeddings=[q_embed], n_results=5)
+def groq_call(messages, max_tokens=300):
+    for attempt in range(3):
+        try:
+            return client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                max_tokens=max_tokens
+            ).choices[0].message.content
+        except Exception as e:
+            if "rate limit" in str(e).lower():
+                time.sleep(5)
+            else:
+                raise e
 
-        if results["documents"] and results["documents"][0]:
-            context = "\n".join(results["documents"][0])[:8000]
-            final_prompt = (
-                "Answer using only the context below.\n\n"
-                f"Context:\n{context}\n\nQuestion:\n{prompt}"
-            )
+# -------------------- SESSION STATE --------------------
+if "docs" not in st.session_state:
+    st.session_state.docs = []
+if "summary" not in st.session_state:
+    st.session_state.summary = ""
 
-            response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": final_prompt}],
-                max_tokens=500
-            )
-            answer = response.choices[0].message.content
-        else:
-            answer = "No relevant information found."
+# -------------------- UI --------------------
+st.sidebar.title("📚 Knowledge Base")
+files = st.sidebar.file_uploader(
+    "Upload PDF or TXT files",
+    type=["pdf", "txt"],
+    accept_multiple_files=True
+)
 
-    except Exception:
-        answer = "Rate limit reached. Please try again later."
+process = st.sidebar.button("Process & Train")
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-    with st.chat_message("assistant"):
-        st.write(answer)
+st.title("Groq PDF Assistant")
+
+# -------------------- PROCESS FILES --------------------
+if process and files:
+    st.session_state.docs.clear()
+    with st.spinner("Processing documents..."):
+        for file in files:
+            text = read_file(file)
+            chunks = chunk_text(text)
+            st.session_state.docs.extend(chunks)
+    st.success(f"Processed {len(st.session_state.docs)} chunks")
+
+# -------------------- SUMMARIZE --------------------
+if st.button("Summarise") and st.session_state.docs:
+    with st.spinner("Generating summary..."):
+        joined = "\n".join(st.session_state.docs[:5])  # limit chunks
+        st.session_state.summary = groq_call([
+            {"role": "system", "content": "Summarize the following document."},
+            {"role": "user", "content": joined}
+        ])
+
+if st.session_state.summary:
+    st.subheader("📄 Summary")
+    st.write(st.session_state.summary)
+
+# -------------------- Q&A --------------------
+st.subheader("❓ Ask a Question")
+question = st.text_input("Ask a question")
+
+if st.button("Ask") and question and st.session_state.docs:
+    with st.spinner("Thinking..."):
+        context = "\n".join(st.session_state.docs[:4])
+        answer = groq_call([
+            {"role": "system", "content": "Answer using the context."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+        ])
+    st.markdown("### ✅ Answer")
+    st.write(answer)
+
+# -------------------- FOOTER --------------------
+st.caption("Powered by Groq • Streamlit")
