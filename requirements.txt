@@ -5,3 +5,6 @@ chromadb
 groq
 python-dotenv
 pysqlite3-binary
+streamlit
+groq
+pypdf2
