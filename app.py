@@ -1,4 +1,3 @@
-```python
 __import__("pysqlite3")
 import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
@@ -14,15 +13,13 @@ from groq import Groq
 
 st.set_page_config(page_title="RAG Chatbot", layout="wide")
 
-# --- AUTH (SERVER SIDE ONLY) ---
 api_key = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
 if not api_key:
-    st.error("GROQ_API_KEY not configured.")
+    st.error("GROQ_API_KEY not configured")
     st.stop()
 
 client = Groq(api_key=api_key)
 
-# --- LOAD RESOURCES ---
 @st.cache_resource
 def load_resources():
     embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -41,9 +38,8 @@ def get_collection():
         metadata={"hnsw:space": "cosine"}
     )
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.subheader("Document Loader")
+    st.subheader("Knowledge Base")
     uploaded_files = st.file_uploader(
         "Upload PDF or TXT files",
         type=["pdf", "txt"],
@@ -51,7 +47,6 @@ with st.sidebar:
     )
     process_btn = st.button("Process & Train")
 
-# --- PROCESS DOCUMENTS ---
 if process_btn and uploaded_files:
     status = st.empty()
     status.info("Processing documents...")
@@ -84,18 +79,16 @@ if process_btn and uploaded_files:
             pass
 
     if chunks:
-        batch_size = 100
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
+        for i in range(0, len(chunks), 100):
+            batch = chunks[i:i + 100]
             embeddings = [e.tolist() for e in embedder.embed(batch)]
             ids = [f"doc_{i+j}" for j in range(len(batch))]
             collection.add(documents=batch, embeddings=embeddings, ids=ids)
 
-        status.success(f"Indexed {len(chunks)} chunks.")
+        status.success(f"Indexed {len(chunks)} chunks")
     else:
-        status.error("No readable text found.")
+        status.error("No readable text found")
 
-# --- CHAT ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -103,7 +96,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-prompt = st.chat_input("Ask a question...")
+prompt = st.chat_input("Ask a question")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -116,7 +109,10 @@ if prompt:
 
         if results["documents"] and results["documents"][0]:
             context = "\n".join(results["documents"][0])[:8000]
-            final_prompt = f"Answer using the context below.\n\nContext:\n{context}\n\nQuestion:\n{prompt}"
+            final_prompt = (
+                "Answer using only the context below.\n\n"
+                f"Context:\n{context}\n\nQuestion:\n{prompt}"
+            )
 
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
@@ -125,12 +121,11 @@ if prompt:
             )
             answer = response.choices[0].message.content
         else:
-            answer = "No relevant context found."
+            answer = "No relevant information found."
 
-    except Exception as e:
-        answer = "Rate limit exceeded. Please try again later." if "rate" in str(e).lower() else str(e)
+    except Exception:
+        answer = "Rate limit reached. Please try again later."
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.write(answer)
-```
